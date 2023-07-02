@@ -1,29 +1,15 @@
 from pollination_dsl.dag import Inputs, DAG, task, Outputs
 from dataclasses import dataclass
-from pollination.honeybee_radiance.sun import CreateSunMatrix, ParseSunUpHours
-from pollination.honeybee_radiance.translate import CreateRadianceFolderGrid
-from pollination.honeybee_radiance.octree import CreateOctree, CreateOctreeWithSky
-from pollination.honeybee_radiance.sky import CreateSkyDome, CreateSkyMatrix
-from pollination.path.copy import Copy
 
-
-# input/output alias
-from pollination.alias.inputs.model import hbjson_model_input
-from pollination.alias.inputs.wea import wea_input
 from pollination.alias.inputs.north import north_input
-from pollination.alias.inputs.radiancepar import rad_par_annual_input
-from pollination.alias.inputs.grid import sensor_count_input, grid_filter_input
-from pollination.alias.outputs.daylight import total_radiation_results, \
-    direct_radiation_results
 
-from ._raytracing import IncidentIrradianceRayTracing
+from pollination.ladybug_radiance.radiation import IncidentRadiation
 
 
 @dataclass
 class IncidentIrradianceEntryPoint(DAG):
     """Incident irradiance entry point."""
 
-    # inputs
     north = Inputs.float(
         default=0,
         description='A number for rotation from north.',
@@ -31,177 +17,83 @@ class IncidentIrradianceEntryPoint(DAG):
         alias=north_input
     )
 
-    sensor_count = Inputs.int(
-        default=200,
-        description='The maximum number of grid points per parallel execution.',
-        spec={'type': 'integer', 'minimum': 1},
-        alias=sensor_count_input
+    high_sky_density = Inputs.bool(
+        description='A boolean to indicate if a sky with high density should be used.',
+        default=False
     )
 
-    radiance_parameters = Inputs.str(
-        description='Radiance parameters for ray tracing.',
-        default='-ab 1 -ad 5000 -lw 2e-05'
+    average_irradiance = Inputs.bool(
+        description='A boolean to display the radiation results in units of average '
+        'irradiance (W/m2) over the time period instead of units of cumulative '
+        'radiation (kWh/m2).', default=False
     )
 
-    grid_filter = Inputs.str(
-        description='Text for a grid identifer or a pattern to filter the sensor grids '
-        'of the model that are simulated. For instance, first_floor_* will simulate '
-        'only the sensor grids that have an identifier that starts with '
-        'first_floor_. By default, all grids in the model will be simulated.',
-        default='*',
-        alias=grid_filter_input
+    radiation_benefit = Inputs.bool(
+        description='Check to run a radiation benefit study that weighs helpful '
+        'winter-time radiation against harmful summer-time radiation.',
+        default=False
     )
 
-    model = Inputs.file(
-        description='A Honeybee model in HBJSON file format.',
-        extensions=['json', 'hbjson'],
-        alias=hbjson_model_input
+    balance_temp = Inputs.float(
+        description='Number for the balance temperature in (C) around which radiation '
+        'switches from being helpful to harmful. Hours where the temperature is below '
+        'this will contribute positively to the benefit (eg. passive solar heating) '
+        'while hours above this temperature will contribute negatively (eg. increased '
+        'cooling load). This should usually be the balance temperature of the building '
+        'being studied.', default=16.,
+        spec={'type': 'number', 'maximum': 26.0, 'minimum': 2.0}
     )
 
-    wea = Inputs.file(
-        description='Wea file.',
-        extensions=['wea'],
-        alias=wea_input
+    ground_reflectance = Inputs.float(
+        description='Number between 0 and 1 for the average ground reflectance. This is '
+        'used to build an emissive ground hemisphere that influences points with an '
+        'unobstructed view to the ground.', default=0.2,
+        spec={'type': 'number', 'maximum': 1.0, 'minimum': 0}
     )
 
-    @task(template=CreateSunMatrix)
-    def generate_sunpath(self, north=north, wea=wea, output_type=1):
-        """Create sunpath for sun-up-hours."""
+    offset_dist = Inputs.float(
+        description='Number in model units for the distance to move points from '
+        'the surfaces of the input geometry.', default=0.01,
+        spec={'type': 'number', 'maximum': 1.0, 'minimum': 0.001}
+    )
+
+    run_period = Inputs.str(
+        description='Analysis period as a string. The string must be formatted as '
+        '{start-month}/{start-day} to {end-month}/{end-day} between {start-hour} and {end-hour} @{time-step} '
+        'Default is 1/1 to 12/31 between 0 and 23 @1 for the whole year.',
+        default='1/1 to 12/31 between 0 and 23 @1'
+    )
+
+    epw = Inputs.file(
+        description='Path to epw weather file.', extensions=['epw']
+    )
+
+    study_mesh = Inputs.file(
+        description='Path to a JSON file for input study mesh in Ladybug Geometry '
+        'format.'
+    )
+
+    context_mesh = Inputs.file(
+        description='Path to a JSON file for input context mesh in Ladybug Geometry '
+        'format.', optional=True
+    )
+
+    @task(template=IncidentRadiation)
+    def calculate_incident_radiation(
+        self, north=north, epw=epw, high_sky_density=high_sky_density,
+        average_irradiance=average_irradiance, radiation_benefit=radiation_benefit,
+        balance_temp=balance_temp, ground_reflectance=ground_reflectance,
+        offset_dist=offset_dist, run_period=run_period, study_mesh=study_mesh,
+        context_mesh=context_mesh
+            ):
+        """Calculate incident radiation."""
         return [
-            {'from': CreateSunMatrix()._outputs.sunpath, 'to': 'resources/sunpath.mtx'},
             {
-                'from': CreateSunMatrix()._outputs.sun_modifiers,
-                'to': 'resources/suns.mod'
+                'from': IncidentRadiation()._outputs.radiation_values,
+                'to': 'results.ill'
             }
         ]
 
-    @task(template=CreateRadianceFolderGrid)
-    def create_rad_folder(self, input_model=model, grid_filter=grid_filter):
-        """Translate the input model to a radiance folder."""
-        return [
-            {
-                'from': CreateRadianceFolderGrid()._outputs.model_folder,
-                'to': 'model'
-            },
-            {
-                'from': CreateRadianceFolderGrid()._outputs.bsdf_folder,
-                'to': 'model/bsdf'
-            },
-            {
-                'from': CreateRadianceFolderGrid()._outputs.sensor_grids_file,
-                'to': 'results/direct/grids_info.json'
-            },
-            {
-                'from': CreateRadianceFolderGrid()._outputs.sensor_grids,
-                'description': 'Sensor grids information.'
-            }
-        ]
-
-    @task(template=Copy, needs=[create_rad_folder])
-    def copy_grid_info(self, src=create_rad_folder._outputs.sensor_grids_file):
-        return [
-            {
-                'from': Copy()._outputs.dst,
-                'to': 'results/total/grids_info.json'
-            }
-        ]
-
-    @task(template=CreateOctree, needs=[create_rad_folder])
-    def create_octree(self, model=create_rad_folder._outputs.model_folder):
-        """Create octree from radiance folder."""
-        return [
-            {
-                'from': CreateOctreeWithSky()._outputs.scene_file,
-                'to': 'resources/scene.oct'
-            }
-        ]
-
-    @task(
-        template=CreateOctreeWithSky, needs=[generate_sunpath, create_rad_folder]
-    )
-    def create_octree_with_suns(
-        self, model=create_rad_folder._outputs.model_folder,
-        sky=generate_sunpath._outputs.sunpath
-    ):
-        """Create octree from radiance folder and sunpath for direct studies."""
-        return [
-            {
-                'from': CreateOctreeWithSky()._outputs.scene_file,
-                'to': 'resources/scene_with_suns.oct'
-            }
-        ]
-
-    @task(template=CreateSkyDome)
-    def create_sky_dome(self):
-        """Create sky dome for daylight coefficient studies."""
-        return [
-            {'from': CreateSkyDome()._outputs.sky_dome, 'to': 'resources/sky.dome'}
-        ]
-
-    @task(template=CreateSkyMatrix)
-    def create_indirect_sky(
-        self, north=north, wea=wea, sky_type='no-sun', output_type='solar',
-        output_format='ASCII', sun_up_hours='sun-up-hours'
-    ):
-        return [
-            {
-                'from': CreateSkyMatrix()._outputs.sky_matrix,
-                'to': 'resources/sky_direct.mtx'
-            }
-        ]
-
-    @task(template=ParseSunUpHours, needs=[generate_sunpath])
-    def parse_sun_up_hours(self, sun_modifiers=generate_sunpath._outputs.sun_modifiers):
-        return [
-            {
-                'from': ParseSunUpHours()._outputs.sun_up_hours,
-                'to': 'results/total/sun-up-hours.txt'
-            }
-        ]
-
-    @task(template=Copy, needs=[parse_sun_up_hours])
-    def copy_sun_up_hours(self, src=parse_sun_up_hours._outputs.sun_up_hours):
-        return [
-            {
-                'from': Copy()._outputs.dst,
-                'to': 'results/direct/sun-up-hours.txt'
-            }
-        ]
-
-    @task(
-        template=IncidentIrradianceRayTracing,
-        needs=[
-            create_sky_dome, create_octree_with_suns, create_octree, generate_sunpath,
-            create_indirect_sky, create_rad_folder
-        ],
-        loop=create_rad_folder._outputs.sensor_grids,
-        sub_folder='initial_results/{{item.name}}',  # create a subfolder for each grid
-        sub_paths={'sensor_grid': 'grid/{{item.full_id}}.pts'}  # sub_path for sensor_grid arg
-    )
-    def incident_irradiance_raytracing(
-        self,
-        sensor_count=sensor_count,
-        radiance_parameters=radiance_parameters,
-        octree_file_with_suns=create_octree_with_suns._outputs.scene_file,
-        octree_file=create_octree._outputs.scene_file,
-        grid_name='{{item.full_id}}',
-        sensor_grid=create_rad_folder._outputs.model_folder,
-        sky_dome=create_sky_dome._outputs.sky_dome,
-        sky_matrix_indirect=create_indirect_sky._outputs.sky_matrix,
-        sunpath=generate_sunpath._outputs.sunpath,
-        sun_modifiers=generate_sunpath._outputs.sun_modifiers,
-        bsdfs=create_rad_folder._outputs.bsdf_folder
-    ):
-        pass
-
-    total_radiation = Outputs.folder(
-        source='results/total', description='Folder with raw result files (.ill) that '
-        'contain matrices of total irradiance.',
-        alias=total_radiation_results
-    )
-
-    direct_radiation = Outputs.folder(
-        source='results/direct', description='Folder with raw result files (.ill) that '
-        'contain matrices of direct irradiance.',
-        alias=direct_radiation_results
+    incident_radiation = Outputs.folder(
+        source='results.ill', description='Study results'
     )
