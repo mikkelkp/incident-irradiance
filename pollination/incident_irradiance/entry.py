@@ -78,22 +78,37 @@ class IncidentIrradianceEntryPoint(DAG):
         'format.', optional=True
     )
 
+    display_context = Inputs.bool(
+        description='Boolean to note whether the context geometry should be included '
+        'in the output visualization.',
+        default=False
+    )
+
     @task(template=IncidentRadiation)
     def calculate_incident_radiation(
         self, north=north, epw=epw, high_sky_density=high_sky_density,
         average_irradiance=average_irradiance, radiation_benefit=radiation_benefit,
         balance_temp=balance_temp, ground_reflectance=ground_reflectance,
         offset_dist=offset_dist, run_period=run_period, study_mesh=study_mesh,
-        context_mesh=context_mesh
+        context_mesh=context_mesh, display_context=display_context
             ):
         """Calculate incident radiation."""
         return [
             {
                 'from': IncidentRadiation()._outputs.radiation_values,
-                'to': 'results.ill'
+                'to': 'radiation_values.json'
+            },
+            {
+                'from': IncidentRadiation()._outputs.visualization_set,
+                'to': 'visualization/viz.vsf'
             }
         ]
 
     incident_radiation = Outputs.folder(
         source='results.ill', description='Study results'
+    )
+
+    visualization_set = Outputs.file(
+        source='visualization/viz.vsf',
+        description='Radiation visualization.',
     )
